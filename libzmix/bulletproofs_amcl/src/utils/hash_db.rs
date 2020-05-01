@@ -36,4 +36,7 @@ impl<T: Clone> InMemoryHashDb<T> {
         let db = HashMap::<Vec<u8>, T>::new();
         Self { db }
     }
+    pub fn len(&self) -> usize {
+        self.db.len()
+    }
 }

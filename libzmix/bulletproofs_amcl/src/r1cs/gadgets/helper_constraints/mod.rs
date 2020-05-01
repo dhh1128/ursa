@@ -52,13 +52,20 @@ pub fn get_repr_in_power_2_base(n: u8, scalar: &FieldElement, num_digits: usize)
 
     let mut base_n = vec![];
     while (base_n.len() != num_digits) && (!s.iszilch()) {
+        // Take the least significant n bits of the node's overall index and use them
+        // as the subindex into the child array at the next level in the tree.
         base_n.push(s.lastbits(n as usize) as u8);
+        // Shift the overall index n bits to the right so we can get more bits from
+        // its right edge the next time through the loop.
         s.fshr(n as usize);
     }
+    // Pad the vector with zeros if we ran out of interesting bits.
     while base_n.len() != num_digits {
         base_n.push(0);
     }
-
+    // Convert into root-to-leaf order. (Leaf subindex is stored rightmost and
+    // therefore first into the vector, with root subindex leftmost and last.)
+    // Here we're switching that.
     base_n.reverse();
     base_n
 }

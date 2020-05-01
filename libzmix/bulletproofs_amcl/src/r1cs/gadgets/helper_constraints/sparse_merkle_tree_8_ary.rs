@@ -13,17 +13,28 @@ use crate::utils::hash_db::HashDb;
 const ARITY: usize = 8;
 
 pub type DbVal8ary = [FieldElement; ARITY];
+
+// The proving algorithm takes an array that always has 1 less than
+// the arity of the nodes. This is because the proof includes the
+// other children but never the one that's disclosed.
 pub type ProofNode8ary = [FieldElement; ARITY - 1];
 
-// The logic of `VanillaSparseMerkleTree4` and `VanillaSparseMerkleTree8` is same. Only the arity
-// and hence the hash function differs. The code is still kept separate for clarity. If code is to be
-// combined then a generic implementation will take the hash and database as type parameters.
+// The logic of `VanillaSparseMerkleTree4` and `VanillaSparseMerkleTree8` are
+// identical. Only the arity and hence the hash function differs. The code is
+// still kept separate for clarity. If code is to be combined then a generic
+// implementation will take the hash and database as type parameters.
 
-/// Sparse merkle tree with arity 8, .i.e each node has 8 children.
+/// Sparse merkle tree with arity 8, i.e each node has 8 children.
 #[derive(Clone, Debug)]
 pub struct VanillaSparseMerkleTree8<'a, MTH: Arity8MerkleTreeHash> {
     pub depth: usize,
     hash_func: &'a MTH,
+    // A "FieldElement" is a member of a mathematical field -- in this
+    // case, a 256-bit number that is associated with an elliptic
+    // curve. In more familiar Merkle trees, this would be a hash value,
+    // and in fact it could be here as well -- but here we want to think
+    // of it as related to a curve because it makes the proof logic
+    // more clear.
     pub root: FieldElement,
 }
 
@@ -35,13 +46,40 @@ where
     pub fn new(
         hash_func: &'a MTH,
         depth: usize,
+        // This object stores all the nodes of the tree, and allows them
+        // to be looked up by their label, which is a 256-bit hash of
+        // their 8 children and which can also be thought of as a 256-bit
+        // number associated with an elliptic curve. This container is NOT
+        // owned by the Merkle tree; it is simply referenced by it.
         hash_db: &mut dyn HashDb<DbVal8ary>,
     ) -> Result<VanillaSparseMerkleTree8<'a, MTH>, BulletproofError> {
+        // Create an empty vector to hold the hashes of the nodes we're
+        // going to create. We will create a single "trunk" of the tree --
+        // just one node at each level, with no children, with the specified
+        // depth -- and store the labels identifying the nodes at each
+        // level.
         let mut empty_tree_hashes: Vec<FieldElement> = vec![];
+        // Put one zeroed out item in it. This represents the leaf node that
+        // has no children.
         empty_tree_hashes.push(FieldElement::zero());
+        // For each layer in the tree above the leaf layer, working our way
+        // toward the root...
         for i in 1..=depth {
+            // Get a reference to the node at the previous level (which becomes
+            // the child of the new one we're making). This child node began its
+            // life by being zeroed out, but unless it was the leaf, its children
+            // were hashed, so it may not be zeroed any more.
+            // TO CLARIFY: What are the inputs to the hash function, besides the
+            // contents of its children? That is, is the label/index/hash for the
+            // leaf node equivalent to sha256(0||0||0||0||0||0||0||0), or are there
+            // additional inputs to the function like the node's position in the
+            // tree? I think the latter must be true, otherwise two leaf nodes could
+            // not be told apart.
             let prev = &empty_tree_hashes[i - 1];
+            // Create a vector of 8 clones of the child (where the clones might
+            // not be zeroed).
             let inp: Vec<FieldElement> = (0..ARITY).map(|_| prev.clone()).collect();
+            // Create a single DbVal8ary item that holds 8 zeroed-out child nodes.
             let mut input: DbVal8ary = [
                 FieldElement::zero(),
                 FieldElement::zero(),
@@ -52,17 +90,32 @@ where
                 FieldElement::zero(),
                 FieldElement::zero(),
             ];
+            // Put the 8 cloned vector values into the array, making the array
+            // possibly different from pure zeros.
             input.clone_from_slice(inp.as_slice());
-            // Hash all 8 children at once
+            // Hash all 8 children at once and put the result into a
+            // 256-bit number. This becomes the index or label of the new
+            // node of the tree that we're stacking on top of what we created
+            // before, working toward the root.
             let new = hash_func.hash(inp)?;
+            // Get the hash output as an array of 32 bytes for convenience
+            // in indexing.
             let key = new.to_bytes();
 
+            // Insert the DbVal8ary item into the DB, using the hash as its
+            // index. This puts a new node at the top of our growing tree trunk.
             hash_db.insert(key, input);
+            // Record the hash of the node we just created.
             empty_tree_hashes.push(new);
         }
 
+        // The root is the last item in the vector.
         let root = empty_tree_hashes[depth].clone();
 
+        // Record the depth, the hash function we're using, and the root in the
+        // Merkle tree structure. We don't actually save anything else in it;
+        // we can derive everything else we need by walking the hash db from the
+        // root.
         Ok(VanillaSparseMerkleTree8 {
             depth,
             hash_func,
@@ -82,6 +135,14 @@ where
         self.get(idx, &mut siblings_wrap, hash_db)?;
         let mut siblings = siblings_wrap.unwrap();
 
+        // Convert the index (a hash value) into a sequence of bytes that
+        // expresses the child indexes (0-7) of each node that must be traversed
+        // to get from the root to the leaf.
+        // Mystery: why or how does the hash value contain enough information
+        // to know this path. I thought hash values would have no observable
+        // relationship to their location. Is it possible that only the bottom
+        // 128 bits of the idx holds a hash value, and some upper bits contain
+        // the path?
         let mut path = Self::leaf_index_to_path(&idx, self.depth);
         // Reverse since path was from root to leaf but i am going leaf to root
         path.reverse();
@@ -135,12 +196,15 @@ where
                 let mut pn: Vec<FieldElement> =
                     (0..ARITY - 1).map(|_| FieldElement::zero()).collect();
                 let mut j = 0;
+                // Copy into the proof the hashes of all children except the one being proved.
                 for (i, c) in children.to_vec().iter().enumerate() {
                     if i != (d as usize) {
                         pn[j] = c.clone();
                         j += 1;
                     }
                 }
+                // I don't understand why it's useful to copy things here. Is there a
+                // Rust ownership issue that makes it necessary?
                 let mut proof_nodes: ProofNode8ary = [
                     FieldElement::zero(),
                     FieldElement::zero(),
@@ -155,6 +219,9 @@ where
             }
         }
 
+        // I don't understand why we're supporting a partial accumulation of proof.
+        // Why would that feature be useful, and why does the loop above not do the
+        // full proof from beginning to end?
         match proof {
             Some(v) => {
                 v.extend_from_slice(&proof_vec);
@@ -193,6 +260,8 @@ where
     /// Get path from root to leaf given a leaf index
     /// Convert leaf index to base 8
     pub fn leaf_index_to_path(idx: &FieldElement, depth: usize) -> Vec<u8> {
+        // 3 (the first arg here) means 2-to-the-third (8), which is the base
+        // used to represent child indices in the tree.
         get_repr_in_power_2_base(3, idx, depth).to_vec()
     }
 
